@@ -1,0 +1,85 @@
+:root {
+  --bg: #050314;
+  --s: #0a0820;
+  --s2: #120f2e;
+  --b: #1e1a4d;
+  --a: #635bff;
+  --aD: rgba(99, 91, 255, 0.15);
+  --tx: #d1d0e5;
+  --mu: #8e8aab;
+  --gr: #10b981;
+  --re: #ef4444;
+  --bl: #3b82f6;
+  --pu: #8b5cf6;
+  --wh: #ffffff;
+  --bk: #000000;
+}
+
+[data-theme="light"] {
+  --bg: #f9fafb;
+  --s: #ffffff;
+  --s2: #f3f4f6;
+  --b: #e5e7eb;
+  --a: #4f46e5;
+  --aD: rgba(79, 70, 229, 0.15);
+  --tx: #1f2937;
+  --mu: #6b7280;
+  --gr: #059669;
+  --re: #dc2626;
+  --bl: #2563eb;
+  --pu: #7c3aed;
+  --wh: #111827;
+  --bk: #ffffff;
+}
+
+/* ── Global Styles ── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--tx);
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  overflow-x: hidden;
+  transition: background-color 0.4s ease, color 0.4s ease;
+}
+
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-thumb {
+  background: #635bff33;
+  border-radius: 3px;
+}
+
+button {
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  transition: opacity 0.15s, transform 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+button:active:not(:disabled) {
+  opacity: 0.8;
+  transform: scale(0.97);
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+input, select, textarea {
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+input[type="checkbox"] {
+  accent-color: #635bff;
+  width: auto;
+  cursor: pointer;
+}
+
+@media (hover: hover) {
+  button:hover:not(:disabled) {
+    opacity: 0.85;
+  }
+}
