@@ -1,586 +1,731 @@
-require("dotenv").config();
-const express = require("express");
-const multer = require("multer");
-const pdfParse = require("pdf-parse");
-const cors = require("cors");
-const rateLimit = require("express-rate-limit");
-const bcrypt = require("bcryptjs");
-const jwt = require("jsonwebtoken");
-const db = require("./db");
+import express from 'express';
+import cors from 'cors';
+import multer from 'multer';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import Groq from 'groq-sdk';
+import Anthropic from '@anthropic-ai/sdk';
+import pkg from 'pg';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import rateLimit from 'express-rate-limit';
+import pdfParse from 'pdf-parse/lib/pdf-parse.js';
+
+const { Pool } = pkg;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 
-// ── CORS ──────────────────────────────────────────────────────────────────────
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map((o) => o.trim())
-  .filter(Boolean);
+// ─── CLIENTS ────────────────────────────────────────────────────────────────
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin) return callback(null, true);
-      if (ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes(origin)) {
-        return callback(null, true);
-      }
-      callback(new Error(`CORS: origin ${origin} not allowed`));
-    },
-    credentials: true,
-  })
-);
-
-app.use(express.json({ limit: "50mb" }));
-
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 },
+// ─── DATABASE ────────────────────────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
-// ── JWT Auth Middleware ───────────────────────────────────────────────────────
-function requireAuth(req, res, next) {
-  const authHeader = req.headers["authorization"] || "";
-  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
-  if (!token) return res.status(401).json({ error: "Unauthorized: no token provided" });
-  try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: "Unauthorized: invalid or expired token" });
-  }
-}
+// ─── CORS ────────────────────────────────────────────────────────────────────
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+  : ['http://localhost:3000', 'http://localhost:5173', 'https://study-forge-frontend.vercel.app'];
 
-// ── Rate Limiters ─────────────────────────────────────────────────────────────
-const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS blocked: ${origin}`));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// ─── RATE LIMITING ───────────────────────────────────────────────────────────
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many requests — please slow down." },
-});
-
-const aiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "AI rate limit hit — max 10 AI requests per minute." },
+  message: { error: 'Too many requests, please try again later.' },
 });
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many auth attempts — try again in 15 minutes." },
+  message: { error: 'Too many auth attempts, please try again later.' },
 });
 
-app.use("/api", globalLimiter);
+app.use('/api/', generalLimiter);
+app.use('/auth/', authLimiter);
 
-// ── AI Clients ────────────────────────────────────────────────────────────────
-async function groq(prompt, system = "", maxTokens = 4096) {
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "llama-3.3-70b-versatile",
-      max_tokens: maxTokens,
-      temperature: 0.4,
-      messages: [
-        ...(system ? [{ role: "system", content: system }] : []),
-        { role: "user", content: prompt },
-      ],
-    }),
-  });
-  const data = await res.json();
-  if (data.error) throw new Error(`Groq error: ${data.error.message}`);
-  return data.choices[0].message.content;
-}
+// ─── FILE UPLOAD ─────────────────────────────────────────────────────────────
+const upload = multer({
+  dest: 'uploads/',
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
+  fileFilter: (req, file, cb) => {
+    const allowed = ['application/pdf', 'text/plain', 'image/jpeg', 'image/png', 'image/webp'];
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF, TXT, JPG, PNG, WEBP files are allowed'));
+    }
+  },
+});
 
-async function claude(userContent, system = "") {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": process.env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 3000,
-      system,
-      messages: [{ role: "user", content: userContent }],
-    }),
-  });
-  const data = await res.json();
-  if (data.error) throw new Error(`Claude error: ${data.error.message}`);
-  return data.content.filter((b) => b.type === "text").map((b) => b.text).join("");
-}
+// ─── JWT MIDDLEWARE ──────────────────────────────────────────────────────────
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer <token>
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function parseJSON(text) {
-  const clean = text.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
-  try { return JSON.parse(clean); } catch (e) {}
-  const arrMatch = clean.match(/\[[\s\S]*\]/);
-  if (arrMatch) try { return JSON.parse(arrMatch[0]); } catch (e) {}
-  const objMatch = clean.match(/\{[\s\S]*\}/);
-  if (objMatch) try { return JSON.parse(objMatch[0]); } catch (e) {}
-  return null;
-}
+  if (!token) {
+    return res.status(401).json({ error: 'Access denied. No token provided.' });
+  }
 
-function truncate(text, chars = 5000) {
-  return text.length > chars ? text.slice(0, chars) + "\n...[content continues]" : text;
-}
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'studyforge_jwt_secret_change_in_production');
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(403).json({ error: 'Invalid or expired token. Please login again.' });
+  }
+};
 
-function chunkText(text, chunkSize = 6000, overlap = 500) {
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+const chunkText = (text, maxChunkSize = 8000) => {
+  if (text.length <= maxChunkSize) return [text];
   const chunks = [];
   let start = 0;
   while (start < text.length) {
-    const end = Math.min(start + chunkSize, text.length);
+    let end = start + maxChunkSize;
+    if (end < text.length) {
+      const lastPeriod = text.lastIndexOf('.', end);
+      if (lastPeriod > start + 1000) end = lastPeriod + 1;
+    }
     chunks.push(text.slice(start, end));
-    if (end === text.length) break;
-    start += chunkSize - overlap;
+    start = end;
   }
   return chunks;
-}
+};
 
-async function generateFlashcardsFromChunk(courseName, content, count) {
-  const system = `You are an expert study assistant. Generate high-quality exam-focused flashcards. Return ONLY valid JSON arrays — no markdown, no explanation, no extra text.`;
-  const prompt = `Generate exactly ${count} flashcards from the following study material for the course "${courseName}".
+const groqChat = async (systemPrompt, userMessage, model = 'llama-3.3-70b-versatile') => {
+  const response = await groq.chat.completions.create({
+    model,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userMessage },
+    ],
+    temperature: 0.7,
+    max_tokens: 4096,
+  });
+  return response.choices[0].message.content;
+};
 
-STUDY MATERIAL:
-${content}
+const parseJSON = (text) => {
+  try {
+    const match = text.match(/```json\n?([\s\S]*?)\n?```/) || text.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
+    return JSON.parse(match ? match[1] : text);
+  } catch {
+    return null;
+  }
+};
 
-DISTRIBUTION:
-- ${Math.round(count * 0.3)} definition cards: "What is [term]?"
-- ${Math.round(count * 0.25)} explanation cards: "How does X work?"
-- ${Math.round(count * 0.2)} comparison cards: "What is the difference between X and Y?"
-- ${Math.round(count * 0.15)} application cards: "Give an example of X"
-- ${Math.round(count * 0.1)} critical thinking: "What are the limitations of X?"
+// ─── HEALTH ROUTES ───────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({
+    status: 'StudyForge API is running',
+    version: '2.0.0',
+    timestamp: new Date().toISOString(),
+    endpoints: {
+      auth: ['/auth/signup', '/auth/login', '/auth/me'],
+      api: ['/api/extract', '/api/flashcards', '/api/quiz', '/api/plan', '/api/grade', '/api/youtube'],
+      sessions: ['/api/sessions', '/api/sessions/save'],
+      progress: ['/api/progress/save', '/api/progress/:planId'],
+      stats: ['/api/stats'],
+    },
+  });
+});
 
-RULES:
-- Answers must be 3-6 sentences minimum
-- Never repeat the same topic twice
-- Cover ALL major topics
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: Math.floor(process.uptime()), timestamp: new Date().toISOString() });
+});
 
-Return ONLY this JSON array:
-[{"q":"question text","a":"detailed answer text","course":"${courseName}"}]`;
-  const raw = await groq(prompt, system, 6000);
-  return parseJSON(raw) || [];
-}
-
-// ── Health Check ──────────────────────────────────────────────────────────────
-app.get("/", (req, res) =>
-  res.json({ status: "StudyForge API running", version: "2.0" })
-);
-
-// ══════════════════════════════════════════════════════════════════════════════
-// AUTH ROUTES — Public, no token needed
-// ══════════════════════════════════════════════════════════════════════════════
+// ─── AUTH ROUTES ─────────────────────────────────────────────────────────────
 
 // POST /auth/signup
-app.post("/auth/signup", authLimiter, async (req, res) => {
+app.post('/auth/signup', async (req, res) => {
   try {
     const { email, password, name } = req.body;
+
     if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required" });
+      return res.status(400).json({ error: 'Email and password are required.' });
     }
     if (password.length < 6) {
-      return res.status(400).json({ error: "Password must be at least 6 characters" });
+      return res.status(400).json({ error: 'Password must be at least 6 characters.' });
     }
 
-    const existing = await db.query(
-      "SELECT id FROM users WHERE email = $1",
-      [email.toLowerCase()]
-    );
+    // Check if user already exists
+    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
     if (existing.rows.length > 0) {
-      return res.status(409).json({ error: "An account with this email already exists" });
+      return res.status(409).json({ error: 'An account with this email already exists.' });
     }
 
+    // Hash password
     const hashedPassword = await bcrypt.hash(password, 12);
 
-    const result = await db.query(
-      "INSERT INTO users (email, password, name, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id, email, name",
+    // Create user
+    const result = await pool.query(
+      'INSERT INTO users (email, password_hash, name, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id, email, name, created_at',
       [email.toLowerCase(), hashedPassword, name || null]
     );
 
     const user = result.rows[0];
     const token = jwt.sign(
-      { id: user.id, email: user.email, name: user.name },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
+      { userId: user.id, email: user.email },
+      process.env.JWT_SECRET || 'studyforge_jwt_secret_change_in_production',
+      { expiresIn: '7d' }
     );
 
     res.status(201).json({
-      message: "Account created successfully",
+      message: 'Account created successfully.',
       token,
-      user: { id: user.id, email: user.email, name: user.name },
+      user: { id: user.id, email: user.email, name: user.name, createdAt: user.created_at },
     });
   } catch (err) {
-    console.error("Signup error:", err);
-    res.status(500).json({ error: err.message });
+    console.error('Signup error:', err);
+    res.status(500).json({ error: 'Failed to create account. Please try again.' });
   }
 });
 
 // POST /auth/login
-app.post("/auth/login", authLimiter, async (req, res) => {
+app.post('/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
+
     if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required" });
+      return res.status(400).json({ error: 'Email and password are required.' });
     }
 
-    const result = await db.query(
-      "SELECT id, email, name, password FROM users WHERE email = $1",
-      [email.toLowerCase()]
-    );
-
-    if (!result.rows.length) {
-      return res.status(401).json({ error: "Invalid email or password" });
+    // Find user
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid email or password.' });
     }
 
     const user = result.rows[0];
-    const valid = await bcrypt.compare(password, user.password);
-    if (!valid) {
-      return res.status(401).json({ error: "Invalid email or password" });
+
+    // Check password
+    const validPassword = await bcrypt.compare(password, user.password_hash);
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Invalid email or password.' });
     }
 
+    // Generate token
     const token = jwt.sign(
-      { id: user.id, email: user.email, name: user.name },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
+      { userId: user.id, email: user.email },
+      process.env.JWT_SECRET || 'studyforge_jwt_secret_change_in_production',
+      { expiresIn: '7d' }
     );
 
     res.json({
-      message: "Login successful",
+      message: 'Login successful.',
       token,
-      user: { id: user.id, email: user.email, name: user.name },
+      user: { id: user.id, email: user.email, name: user.name, createdAt: user.created_at },
     });
   } catch (err) {
-    console.error("Login error:", err);
-    res.status(500).json({ error: err.message });
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Login failed. Please try again.' });
   }
 });
 
-// GET /auth/me — get current logged in user
-app.get("/auth/me", requireAuth, async (req, res) => {
+// GET /auth/me
+app.get('/auth/me', authenticateToken, async (req, res) => {
   try {
-    const result = await db.query(
-      "SELECT id, email, name, created_at FROM users WHERE id = $1",
-      [req.user.id]
+    const result = await pool.query(
+      'SELECT id, email, name, created_at FROM users WHERE id = $1',
+      [req.user.userId]
     );
-    if (!result.rows.length) return res.status(404).json({ error: "User not found" });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
     res.json({ user: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Get user error:', err);
+    res.status(500).json({ error: 'Failed to get user info.' });
   }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
-// API ROUTES — Protected, JWT required
-// ══════════════════════════════════════════════════════════════════════════════
+// ─── API ROUTES (JWT PROTECTED) ──────────────────────────────────────────────
 
-// POST /api/extract
-app.post("/api/extract", requireAuth, upload.array("files", 20), async (req, res) => {
+// POST /api/extract — Upload and extract text from PDF/TXT
+app.post('/api/extract', authenticateToken, upload.single('file'), async (req, res) => {
   try {
-    const results = [];
-    for (const file of req.files) {
-      const isPDF = file.mimetype === "application/pdf" || file.originalname.endsWith(".pdf");
-      let text = "";
-      if (isPDF) {
-        try {
-          const parsed = await pdfParse(file.buffer);
-          text = parsed.text || "";
-        } catch (e) {
-          text = "[Could not extract PDF text — file may be image-based]";
-        }
-      } else {
-        text = file.buffer.toString("utf-8");
-      }
-      results.push({
-        name: file.originalname,
-        text: text.trim(),
-        size: file.size,
-        charCount: text.trim().length,
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded.' });
+    }
+
+    const filePath = req.file.path;
+    let extractedText = '';
+
+    if (req.file.mimetype === 'application/pdf') {
+      const dataBuffer = fs.readFileSync(filePath);
+      const pdfData = await pdfParse(dataBuffer);
+      extractedText = pdfData.text;
+    } else if (req.file.mimetype === 'text/plain') {
+      extractedText = fs.readFileSync(filePath, 'utf8');
+    } else {
+      // Image — use Groq vision
+      const imageData = fs.readFileSync(filePath).toString('base64');
+      const response = await groq.chat.completions.create({
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Extract all text from this image. Return only the extracted text, nothing else.' },
+            { type: 'image_url', image_url: { url: `data:${req.file.mimetype};base64,${imageData}` } },
+          ],
+        }],
+        max_tokens: 4096,
       });
+      extractedText = response.choices[0].message.content;
     }
-    res.json({ files: results });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
-// POST /api/flashcards
-app.post("/api/flashcards", requireAuth, aiLimiter, async (req, res) => {
-  try {
-    const { courseName = "Course", content, count = 25 } = req.body;
-    if (!content) return res.status(400).json({ error: "content is required" });
-    const CHUNK_SIZE = 6000;
-    if (content.length <= CHUNK_SIZE) {
-      const cards = await generateFlashcardsFromChunk(courseName, content, count);
-      if (!cards.length) return res.status(500).json({ error: "Could not generate flashcards — try again" });
-      return res.json({ cards, count: cards.length });
+    // Clean up uploaded file
+    fs.unlinkSync(filePath);
+
+    if (!extractedText || extractedText.trim().length < 10) {
+      return res.status(422).json({ error: 'Could not extract readable text from this file.' });
     }
-    const chunks = chunkText(content, CHUNK_SIZE, 500);
-    const cardsPerChunk = Math.ceil(count / chunks.length);
-    const allCards = [];
-    for (const chunk of chunks) {
-      const cards = await generateFlashcardsFromChunk(courseName, chunk, cardsPerChunk);
-      allCards.push(...cards);
-    }
-    const seen = new Set();
-    const unique = allCards.filter((c) => {
-      const key = c.q?.toLowerCase().trim();
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
+
+    res.json({
+      success: true,
+      text: extractedText.trim(),
+      wordCount: extractedText.trim().split(/\s+/).length,
+      charCount: extractedText.trim().length,
     });
-    const final = unique.slice(0, count);
-    if (!final.length) return res.status(500).json({ error: "Could not generate flashcards — try again" });
-    res.json({ cards: final, count: final.length });
   } catch (err) {
-    console.error("Flashcards error:", err);
-    res.status(500).json({ error: err.message });
+    console.error('Extract error:', err);
+    if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+    res.status(500).json({ error: 'Failed to extract text from file.' });
   }
 });
 
-// POST /api/quiz
-app.post("/api/quiz", requireAuth, aiLimiter, async (req, res) => {
+// POST /api/flashcards — Generate flashcards from text
+app.post('/api/flashcards', authenticateToken, async (req, res) => {
   try {
-    const { courseName = "Course", content, mcqCount = 5, theoryCount = 4 } = req.body;
-    if (!content) return res.status(400).json({ error: "content is required" });
-    const system = `You are an expert exam creator. Always return ONLY valid JSON — no markdown fences, no explanation.`;
-    const prompt = `Create a mixed quiz for the course "${courseName}".
+    const { content, count = 10, difficulty = 'medium' } = req.body;
 
-STUDY MATERIAL:
-${truncate(content, 6000)}
+    if (!content) {
+      return res.status(400).json({ error: 'Content is required.' });
+    }
 
-PART A — ${mcqCount} MCQ questions (4 options, one correct answer, include explanation)
-PART B — ${theoryCount} Theory questions (include modelAnswer, marks: 5)
+    const chunks = chunkText(content);
+    const allFlashcards = [];
 
-Return ONLY this JSON array:
+    for (const chunk of chunks.slice(0, 3)) { // Max 3 chunks
+      const systemPrompt = `You are an expert educator. Generate exactly ${count} high-quality flashcards from the provided content.
+Difficulty level: ${difficulty}.
+Return ONLY a valid JSON array in this exact format:
 [
-  {"type":"mcq","q":"question","options":["A","B","C","D"],"answer":0,"explanation":"why correct"},
-  {"type":"theory","q":"Explain...","modelAnswer":"comprehensive answer...","marks":5}
-]`;
-    const raw = await groq(prompt, system, 5000);
-    const questions = parseJSON(raw);
-    if (!questions || !questions.length) return res.status(500).json({ error: "Could not generate quiz — try again" });
-    const valid = questions.filter((q) =>
-      q.type && q.q && (
-        (q.type === "mcq" && Array.isArray(q.options) && typeof q.answer === "number") ||
-        (q.type === "theory" && q.modelAnswer)
-      )
-    );
-    res.json({ questions: valid, count: valid.length });
+  { "front": "Question or concept", "back": "Answer or explanation", "topic": "Topic name" }
+]
+No extra text, no markdown, just the JSON array.`;
+
+      const result = await groqChat(systemPrompt, chunk);
+      const parsed = parseJSON(result);
+      if (parsed && Array.isArray(parsed)) {
+        allFlashcards.push(...parsed);
+      }
+    }
+
+    if (allFlashcards.length === 0) {
+      return res.status(500).json({ error: 'Failed to generate flashcards. Please try again.' });
+    }
+
+    res.json({
+      success: true,
+      flashcards: allFlashcards.slice(0, count * chunks.length),
+      count: allFlashcards.length,
+    });
   } catch (err) {
-    console.error("Quiz error:", err);
-    res.status(500).json({ error: err.message });
+    console.error('Flashcards error:', err);
+    res.status(500).json({ error: 'Failed to generate flashcards.' });
   }
 });
 
-// POST /api/plan
-app.post("/api/plan", requireAuth, aiLimiter, async (req, res) => {
+// POST /api/quiz — Generate quiz questions
+app.post('/api/quiz', authenticateToken, async (req, res) => {
   try {
-    const { courses, examWeeks = 4, hoursPerDay = 2 } = req.body;
-    if (!courses || !courses.length) return res.status(400).json({ error: "courses is required" });
-    const today = new Date();
-    const examDate = new Date(today);
-    examDate.setDate(today.getDate() + examWeeks * 7);
-    const studyDays = examWeeks * 7 - 7;
-    const hoursPerCourse = Math.floor((studyDays * hoursPerDay) / courses.length);
-    const courseInfo = courses.map((c) => `Course: ${c.name}\n${truncate(c.content || "", 1500)}`).join("\n\n---\n\n");
-    const system = `You are an expert academic advisor. Always return ONLY valid JSON arrays with no extra text.`;
-    const prompt = `Create a day-by-day study timetable.
+    const { content, count = 10, type = 'multiple_choice' } = req.body;
 
-Today: ${today.toISOString().split("T")[0]}
-Exam: ${examDate.toISOString().split("T")[0]} | Hours/day: ${hoursPerDay} | Study days: ${studyDays} | Hours per course: ~${hoursPerCourse}h
+    if (!content) {
+      return res.status(400).json({ error: 'Content is required.' });
+    }
 
-COURSES:
-${courseInfo}
+    const chunks = chunkText(content);
+    const allQuestions = [];
 
-RULES: Start tomorrow, rotate courses, last 7 days = revision, max 30 entries, be specific with topic names.
+    for (const chunk of chunks.slice(0, 3)) {
+      const systemPrompt = `You are an expert educator. Generate exactly ${count} quiz questions from the provided content.
+Question type: ${type}.
+Return ONLY a valid JSON array in this exact format:
+[
+  {
+    "question": "The question text",
+    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "correct": 0,
+    "explanation": "Why this answer is correct"
+  }
+]
+"correct" is the index (0-3) of the correct option.
+No extra text, no markdown, just the JSON array.`;
 
-Return ONLY:
-[{"date":"YYYY-MM-DD","course":"name","topic":"specific topic","pages":"Pages X-Y","duration":"${hoursPerDay}h","type":"study","done":false}]
+      const result = await groqChat(systemPrompt, chunk);
+      const parsed = parseJSON(result);
+      if (parsed && Array.isArray(parsed)) {
+        allQuestions.push(...parsed);
+      }
+    }
 
-For revision days use "type":"revision"`;
-    const raw = await groq(prompt, system, 4000);
-    const plan = parseJSON(raw);
-    if (!plan || !plan.length) return res.status(500).json({ error: "Could not generate timetable — try again" });
-    const withIds = plan
-      .filter((p) => p.date && p.course && p.topic)
-      .sort((a, b) => a.date.localeCompare(b.date))
-      .map((p, i) => ({ ...p, id: "p" + i, done: false }));
-    res.json({ plan: withIds, count: withIds.length });
+    if (allQuestions.length === 0) {
+      return res.status(500).json({ error: 'Failed to generate quiz. Please try again.' });
+    }
+
+    res.json({
+      success: true,
+      questions: allQuestions.slice(0, count * chunks.length),
+      count: allQuestions.length,
+    });
   } catch (err) {
-    console.error("Plan error:", err);
-    res.status(500).json({ error: err.message });
+    console.error('Quiz error:', err);
+    res.status(500).json({ error: 'Failed to generate quiz.' });
   }
 });
 
-// POST /api/grade
-app.post("/api/grade", requireAuth, aiLimiter, async (req, res) => {
+// POST /api/plan — Generate study timetable
+app.post('/api/plan', authenticateToken, async (req, res) => {
   try {
-    const { answers } = req.body;
-    if (!answers || !answers.length) return res.status(400).json({ error: "answers is required" });
-    const prompt = `Grade these student theory answers strictly and fairly.
+    const { content, examDate, hoursPerDay = 2, subject = 'General' } = req.body;
 
-${answers.map((a, i) => `QUESTION ${i + 1} (${a.marks || 5} marks):\n${a.q}\n\nMODEL ANSWER:\n${a.modelAnswer}\n\nSTUDENT ANSWER:\n${a.studentAnswer || "(No answer)"}`).join("\n---\n")}
+    if (!content) {
+      return res.status(400).json({ error: 'Content is required.' });
+    }
 
-Return ONLY: [{"score":3,"feedback":"specific feedback"}]`;
-    const raw = await claude(prompt, "You are a strict but fair academic marker. Return only valid JSON arrays.");
-    const grades = parseJSON(raw);
-    if (!grades || !grades.length) return res.status(500).json({ error: "Could not grade answers — try again" });
-    res.json({ grades });
+    const systemPrompt = `You are an expert study planner. Create a detailed, realistic study timetable.
+Subject: ${subject}
+Exam date: ${examDate || 'Not specified'}
+Available hours per day: ${hoursPerDay}
+
+Return ONLY a valid JSON object in this exact format:
+{
+  "totalDays": 14,
+  "hoursPerDay": 2,
+  "plan": [
+    {
+      "day": 1,
+      "date": "Day 1",
+      "topics": ["Topic 1", "Topic 2"],
+      "tasks": ["Read chapter 1", "Make notes"],
+      "duration": "2 hours",
+      "focus": "Introduction and basics"
+    }
+  ],
+  "tips": ["Study tip 1", "Study tip 2"],
+  "summary": "Brief overview of the study plan"
+}
+No extra text, no markdown, just the JSON object.`;
+
+    const result = await groqChat(systemPrompt, content.slice(0, 8000));
+    const parsed = parseJSON(result);
+
+    if (!parsed) {
+      return res.status(500).json({ error: 'Failed to generate study plan. Please try again.' });
+    }
+
+    res.json({ success: true, plan: parsed });
   } catch (err) {
-    console.error("Grade error:", err);
-    res.status(500).json({ error: err.message });
+    console.error('Plan error:', err);
+    res.status(500).json({ error: 'Failed to generate study plan.' });
   }
 });
 
-// POST /api/youtube
-app.post("/api/youtube", requireAuth, aiLimiter, async (req, res) => {
+// POST /api/grade — Grade a written answer (uses Claude for nuanced grading)
+app.post('/api/grade', authenticateToken, async (req, res) => {
   try {
-    const { url, topic = "" } = req.body;
-    if (!url) return res.status(400).json({ error: "url is required" });
-    const videoId = url.match(/(?:v=|youtu\.be\/)([^&\s]+)/)?.[1] || "";
-    if (!videoId) return res.status(400).json({ error: "Invalid YouTube URL" });
-    let transcriptText = null;
+    const { question, answer, context = '' } = req.body;
+
+    if (!question || !answer) {
+      return res.status(400).json({ error: 'Question and answer are required.' });
+    }
+
+    const prompt = `You are an expert examiner. Grade the following student answer.
+
+Question: ${question}
+${context ? `Context/Notes: ${context.slice(0, 3000)}` : ''}
+Student Answer: ${answer}
+
+Return ONLY a valid JSON object in this exact format:
+{
+  "score": 85,
+  "grade": "B+",
+  "feedback": "Detailed feedback on the answer",
+  "strengths": ["What was done well"],
+  "improvements": ["What could be improved"],
+  "modelAnswer": "A model answer for comparison"
+}
+Score is out of 100. No extra text, just the JSON.`;
+
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-20240307',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const parsed = parseJSON(response.content[0].text);
+
+    if (!parsed) {
+      return res.status(500).json({ error: 'Failed to grade answer. Please try again.' });
+    }
+
+    res.json({ success: true, result: parsed });
+  } catch (err) {
+    console.error('Grade error:', err);
+    res.status(500).json({ error: 'Failed to grade answer.' });
+  }
+});
+
+// POST /api/youtube — Extract transcript and generate flashcards from YouTube
+app.post('/api/youtube', authenticateToken, async (req, res) => {
+  try {
+    const { url, count = 10 } = req.body;
+
+    if (!url) {
+      return res.status(400).json({ error: 'YouTube URL is required.' });
+    }
+
+    // Extract video ID
+    const videoIdMatch = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)/);
+    if (!videoIdMatch) {
+      return res.status(400).json({ error: 'Invalid YouTube URL.' });
+    }
+    const videoId = videoIdMatch[1];
+
+    // Get transcript using youtubei.js
+    let transcript = '';
     try {
-      const { Innertube } = await import("youtubei.js");
+      const { Innertube } = await import('youtubei.js');
       const youtube = await Innertube.create({ retrieve_player: false });
       const info = await youtube.getInfo(videoId);
       const transcriptData = await info.getTranscript();
-      const segments = transcriptData?.transcript?.content?.body?.initial_segments || [];
-      transcriptText = segments.map((s) => s?.snippet?.text || "").join(" ").trim() || null;
-    } catch (e) {
-      console.warn("Transcript unavailable:", e.message);
+      transcript = transcriptData.transcript.content.body.initial_segments
+        .map(seg => seg.snippet.text)
+        .join(' ');
+    } catch (transcriptErr) {
+      console.error('Transcript fetch error:', transcriptErr);
+      return res.status(422).json({ error: 'Could not fetch transcript. The video may not have captions enabled.' });
     }
-    const system = `You are a study assistant. Return ONLY valid JSON arrays.`;
-    let prompt;
-    if (transcriptText) {
-      prompt = `Generate 8 flashcards from this YouTube transcript:\n\n${truncate(transcriptText, 6000)}\n\nReturn ONLY: [{"q":"question","a":"detailed answer","course":"From YouTube"}]`;
-    } else {
-      if (!topic) return res.status(422).json({ error: "No transcript available. Please provide a topic hint.", requiresTopic: true });
-      prompt = `Generate 8 flashcards on the topic: "${topic}"\n\nReturn ONLY: [{"q":"question","a":"detailed answer","course":"From YouTube (topic-based)"}]`;
+
+    if (!transcript || transcript.trim().length < 50) {
+      return res.status(422).json({ error: 'Transcript is too short or empty.' });
     }
-    const raw = await groq(prompt, system, 3000);
-    const cards = parseJSON(raw);
-    if (!cards || !cards.length) return res.status(500).json({ error: "Could not generate cards — try again" });
-    res.json({ cards, count: cards.length, source: transcriptText ? "transcript" : "topic-based" });
+
+    // Generate flashcards from transcript
+    const systemPrompt = `You are an expert educator. Generate exactly ${count} high-quality flashcards from this YouTube video transcript.
+Return ONLY a valid JSON array in this exact format:
+[
+  { "front": "Question or concept", "back": "Answer or explanation", "topic": "Topic name" }
+]
+No extra text, no markdown, just the JSON array.`;
+
+    const result = await groqChat(systemPrompt, transcript.slice(0, 8000));
+    const flashcards = parseJSON(result);
+
+    if (!flashcards || !Array.isArray(flashcards)) {
+      return res.status(500).json({ error: 'Failed to generate flashcards from video.' });
+    }
+
+    res.json({
+      success: true,
+      videoId,
+      transcriptLength: transcript.length,
+      flashcards,
+      count: flashcards.length,
+    });
   } catch (err) {
-    console.error("YouTube error:", err);
-    res.status(500).json({ error: err.message });
+    console.error('YouTube error:', err);
+    res.status(500).json({ error: 'Failed to process YouTube video.' });
   }
 });
 
-// ── Sessions ──────────────────────────────────────────────────────────────────
-app.post("/api/sessions/save", requireAuth, async (req, res) => {
+// ─── SESSION ROUTES ──────────────────────────────────────────────────────────
+
+// POST /api/sessions/save
+app.post('/api/sessions/save', authenticateToken, async (req, res) => {
   try {
-    const { type, courseName, data } = req.body;
-    if (!type || !data) return res.status(400).json({ error: "type and data required" });
-    const result = await db.query(
-      "INSERT INTO sessions (user_id, type, course_name, data, created_at) VALUES ($1,$2,$3,$4,NOW()) RETURNING id",
-      [req.user.id, type, courseName || null, JSON.stringify(data)]
+    const { title, type, content, data } = req.body;
+
+    if (!title || !type) {
+      return res.status(400).json({ error: 'Title and type are required.' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO sessions (user_id, title, type, content, data, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       RETURNING id, title, type, created_at`,
+      [req.user.userId, title, type, content || null, JSON.stringify(data || {})]
     );
-    res.json({ success: true, sessionId: result.rows[0].id });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+
+    res.status(201).json({ success: true, session: result.rows[0] });
+  } catch (err) {
+    console.error('Save session error:', err);
+    res.status(500).json({ error: 'Failed to save session.' });
+  }
 });
 
-app.get("/api/sessions", requireAuth, async (req, res) => {
+// GET /api/sessions
+app.get('/api/sessions', authenticateToken, async (req, res) => {
   try {
-    const { type } = req.query;
-    const query = type
-      ? "SELECT id, type, course_name, created_at FROM sessions WHERE user_id=$1 AND type=$2 ORDER BY created_at DESC"
-      : "SELECT id, type, course_name, created_at FROM sessions WHERE user_id=$1 ORDER BY created_at DESC";
-    const result = await db.query(query, type ? [req.user.id, type] : [req.user.id]);
-    res.json({ sessions: result.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get("/api/sessions/:sessionId", requireAuth, async (req, res) => {
-  try {
-    const result = await db.query(
-      "SELECT * FROM sessions WHERE id=$1 AND user_id=$2",
-      [req.params.sessionId, req.user.id]
+    const result = await pool.query(
+      `SELECT id, title, type, created_at FROM sessions
+       WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      [req.user.userId]
     );
-    if (!result.rows.length) return res.status(404).json({ error: "Session not found" });
-    res.json({ session: result.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    res.json({ success: true, sessions: result.rows });
+  } catch (err) {
+    console.error('Get sessions error:', err);
+    res.status(500).json({ error: 'Failed to get sessions.' });
+  }
 });
 
-app.delete("/api/sessions/:sessionId", requireAuth, async (req, res) => {
+// GET /api/sessions/:sessionId
+app.get('/api/sessions/:sessionId', authenticateToken, async (req, res) => {
   try {
-    await db.query(
-      "DELETE FROM sessions WHERE id=$1 AND user_id=$2",
-      [req.params.sessionId, req.user.id]
+    const result = await pool.query(
+      'SELECT * FROM sessions WHERE id = $1 AND user_id = $2',
+      [req.params.sessionId, req.user.userId]
     );
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Session not found.' });
+    }
+    res.json({ success: true, session: result.rows[0] });
+  } catch (err) {
+    console.error('Get session error:', err);
+    res.status(500).json({ error: 'Failed to get session.' });
+  }
 });
 
-// ── Progress ──────────────────────────────────────────────────────────────────
-app.post("/api/progress/save", requireAuth, async (req, res) => {
+// DELETE /api/sessions/:sessionId
+app.delete('/api/sessions/:sessionId', authenticateToken, async (req, res) => {
   try {
-    const { planId, sessionId, done } = req.body;
-    if (!planId || !sessionId) return res.status(400).json({ error: "planId and sessionId required" });
-    await db.query(
-      `INSERT INTO progress (user_id, plan_id, session_id, done, updated_at)
-       VALUES ($1,$2,$3,$4,NOW())
-       ON CONFLICT (user_id, plan_id, session_id)
-       DO UPDATE SET done=$4, updated_at=NOW()`,
-      [req.user.id, planId, sessionId, done ?? true]
+    const result = await pool.query(
+      'DELETE FROM sessions WHERE id = $1 AND user_id = $2 RETURNING id',
+      [req.params.sessionId, req.user.userId]
     );
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Session not found.' });
+    }
+    res.json({ success: true, message: 'Session deleted.' });
+  } catch (err) {
+    console.error('Delete session error:', err);
+    res.status(500).json({ error: 'Failed to delete session.' });
+  }
 });
 
-app.get("/api/progress/:planId", requireAuth, async (req, res) => {
+// ─── PROGRESS ROUTES ─────────────────────────────────────────────────────────
+
+// POST /api/progress/save
+app.post('/api/progress/save', authenticateToken, async (req, res) => {
   try {
-    const result = await db.query(
-      "SELECT session_id, done, updated_at FROM progress WHERE user_id=$1 AND plan_id=$2",
-      [req.user.id, req.params.planId]
+    const { planId, dayNumber, completed, notes } = req.body;
+
+    if (!planId || dayNumber === undefined) {
+      return res.status(400).json({ error: 'planId and dayNumber are required.' });
+    }
+
+    await pool.query(
+      `INSERT INTO progress (user_id, plan_id, day_number, completed, notes, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (user_id, plan_id, day_number)
+       DO UPDATE SET completed = $4, notes = $5, updated_at = NOW()`,
+      [req.user.userId, planId, dayNumber, completed || false, notes || null]
     );
-    res.json({ progress: result.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+
+    res.json({ success: true, message: 'Progress saved.' });
+  } catch (err) {
+    console.error('Save progress error:', err);
+    res.status(500).json({ error: 'Failed to save progress.' });
+  }
 });
 
-// ── Stats ─────────────────────────────────────────────────────────────────────
-app.get("/api/stats", requireAuth, async (req, res) => {
+// GET /api/progress/:planId
+app.get('/api/progress/:planId', authenticateToken, async (req, res) => {
   try {
-    const [s, p] = await Promise.all([
-      db.query(
-        "SELECT type, COUNT(*) as count FROM sessions WHERE user_id=$1 GROUP BY type",
-        [req.user.id]
-      ),
-      db.query(
-        "SELECT COUNT(*) as total, SUM(CASE WHEN done=true THEN 1 ELSE 0 END) as completed FROM progress WHERE user_id=$1",
-        [req.user.id]
-      ),
+    const result = await pool.query(
+      'SELECT * FROM progress WHERE user_id = $1 AND plan_id = $2 ORDER BY day_number',
+      [req.user.userId, req.params.planId]
+    );
+    res.json({ success: true, progress: result.rows });
+  } catch (err) {
+    console.error('Get progress error:', err);
+    res.status(500).json({ error: 'Failed to get progress.' });
+  }
+});
+
+// ─── STATS ROUTE ─────────────────────────────────────────────────────────────
+
+// GET /api/stats
+app.get('/api/stats', authenticateToken, async (req, res) => {
+  try {
+    const [sessionsResult, progressResult] = await Promise.all([
+      pool.query('SELECT type, COUNT(*) as count FROM sessions WHERE user_id = $1 GROUP BY type', [req.user.userId]),
+      pool.query('SELECT COUNT(*) as completed FROM progress WHERE user_id = $1 AND completed = true', [req.user.userId]),
     ]);
-    const sessionCounts = {};
-    for (const row of s.rows) sessionCounts[row.type] = parseInt(row.count);
-    const pr = p.rows[0];
+
+    const sessionsByType = {};
+    sessionsResult.rows.forEach(row => {
+      sessionsByType[row.type] = parseInt(row.count);
+    });
+
     res.json({
-      sessions: sessionCounts,
-      progress: {
-        total: parseInt(pr.total) || 0,
-        completed: parseInt(pr.completed) || 0,
-        completionRate: pr.total > 0 ? Math.round((pr.completed / pr.total) * 100) : 0,
+      success: true,
+      stats: {
+        totalSessions: sessionsResult.rows.reduce((sum, r) => sum + parseInt(r.count), 0),
+        sessionsByType,
+        completedStudyDays: parseInt(progressResult.rows[0]?.completed || 0),
       },
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    console.error('Stats error:', err);
+    res.status(500).json({ error: 'Failed to get stats.' });
+  }
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// ─── ERROR HANDLER ───────────────────────────────────────────────────────────
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  if (err.message?.includes('CORS')) {
+    return res.status(403).json({ error: err.message });
+  }
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ error: 'File too large. Maximum size is 20MB.' });
+  }
+  res.status(500).json({ error: err.message || 'Internal server error.' });
+});
+
+// ─── START SERVER ────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`StudyForge API v2.0 running on port ${PORT}`);
-  console.log(`Groq key: ${process.env.GROQ_API_KEY ? "✓ set" : "✗ MISSING"}`);
-  console.log(`Claude key: ${process.env.ANTHROPIC_API_KEY ? "✓ set" : "✗ MISSING"}`);
-  console.log(`JWT secret: ${process.env.JWT_SECRET ? "✓ set" : "✗ MISSING — AUTH WILL FAIL"}`);
-  console.log(`CORS origins: ${process.env.ALLOWED_ORIGINS || "* (all)"}`);
+  console.log(`✅ StudyForge API running on port ${PORT}`);
+  console.log(`📦 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🔐 JWT Secret: ${process.env.JWT_SECRET ? 'SET ✓' : 'USING DEFAULT (set JWT_SECRET in production!)'}`);
+  console.log(`🗄️  Database: ${process.env.DATABASE_URL ? 'CONNECTED ✓' : 'NOT SET ⚠️'}`);
+  console.log(`🤖 Groq: ${process.env.GROQ_API_KEY ? 'SET ✓' : 'NOT SET ⚠️'}`);
+  console.log(`🧠 Anthropic: ${process.env.ANTHROPIC_API_KEY ? 'SET ✓' : 'NOT SET ⚠️'}`);
+  console.log(`🌐 Allowed Origins: ${allowedOrigins.join(', ')}`);
 });
