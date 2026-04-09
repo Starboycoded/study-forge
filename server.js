@@ -12,25 +12,31 @@ import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
 import pdfParse from 'pdf-parse/lib/pdf-parse.js';
 
+
 const { Pool } = pkg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+
 const app = express();
 const PORT = process.env.PORT || 3000;
+
 
 // Trust Render's reverse proxy (fixes ERR_ERL_UNEXPECTED_X_FORWARDED_FOR)
 app.set('trust proxy', 1);
 
+
 // --- CLIENTS ---
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
 
 // --- DATABASE ---
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
+
 
 // --- CORS ---
 const allowedOrigins = process.env.ALLOWED_ORIGINS
@@ -41,6 +47,7 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
       'https://study-forge-frontend.vercel.app',
       'https://studyforge-frontend.vercel.app',
     ];
+
 
 app.use(cors({
   origin: (origin, callback) => {
@@ -55,8 +62,10 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
 
 // --- RATE LIMITING ---
 const generalLimiter = rateLimit({
@@ -65,14 +74,17 @@ const generalLimiter = rateLimit({
   message: { error: 'Too many requests, please try again later.' },
 });
 
+
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
   message: { error: 'Too many auth attempts, please try again later.' },
 });
 
+
 app.use('/api/', generalLimiter);
 app.use('/auth/', authLimiter);
+
 
 // --- FILE UPLOAD ---
 const upload = multer({
@@ -84,6 +96,7 @@ const upload = multer({
     else cb(new Error('Only PDF, TXT, JPG, PNG, WEBP files are allowed'));
   },
 });
+
 
 // --- JWT MIDDLEWARE ---
 const authenticateToken = (req, res, next) => {
@@ -98,6 +111,7 @@ const authenticateToken = (req, res, next) => {
     return res.status(403).json({ error: 'Invalid or expired token. Please login again.' });
   }
 };
+
 
 // --- HELPERS ---
 const chunkText = (text, maxChunkSize = 8000) => {
@@ -116,6 +130,7 @@ const chunkText = (text, maxChunkSize = 8000) => {
   return chunks;
 };
 
+
 const groqChat = async (systemPrompt, userMessage, model = 'llama-3.3-70b-versatile') => {
   const response = await groq.chat.completions.create({
     model,
@@ -129,12 +144,14 @@ const groqChat = async (systemPrompt, userMessage, model = 'llama-3.3-70b-versat
   return response.choices[0].message.content;
 };
 
+
 const parseJSON = (text) => {
   try {
     const match = text.match(/```json\n?([\s\S]*?)\n?```/) || text.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
     return JSON.parse(match ? match[1] : text);
   } catch { return null; }
 };
+
 
 // --- HEALTH ---
 app.get('/', (req, res) => {
@@ -150,9 +167,11 @@ app.get('/', (req, res) => {
   });
 });
 
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', uptime: Math.floor(process.uptime()), timestamp: new Date().toISOString() });
 });
+
 
 // --- AUTH ---
 app.post('/auth/signup', async (req, res) => {
@@ -173,6 +192,7 @@ app.post('/auth/signup', async (req, res) => {
   } catch (err) { console.error('Signup error:', err); res.status(500).json({ error: 'Failed to create account. Please try again.' }); }
 });
 
+
 app.post('/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -187,6 +207,7 @@ app.post('/auth/login', async (req, res) => {
   } catch (err) { console.error('Login error:', err); res.status(500).json({ error: 'Login failed. Please try again.' }); }
 });
 
+
 app.get('/auth/me', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT id, email, name, created_at FROM users WHERE id = $1', [req.user.userId]);
@@ -194,6 +215,7 @@ app.get('/auth/me', authenticateToken, async (req, res) => {
     res.json({ user: result.rows[0] });
   } catch (err) { console.error('Get user error:', err); res.status(500).json({ error: 'Failed to get user info.' }); }
 });
+
 
 // --- API ROUTES ---
 app.post('/api/extract', authenticateToken, upload.single('file'), async (req, res) => {
@@ -226,6 +248,7 @@ app.post('/api/extract', authenticateToken, upload.single('file'), async (req, r
   }
 });
 
+
 app.post('/api/flashcards', authenticateToken, async (req, res) => {
   try {
     const { content, count = 10, difficulty = 'medium' } = req.body;
@@ -242,6 +265,7 @@ app.post('/api/flashcards', authenticateToken, async (req, res) => {
     res.json({ success: true, flashcards: allFlashcards.slice(0, count * chunks.length), count: allFlashcards.length });
   } catch (err) { console.error('Flashcards error:', err); res.status(500).json({ error: 'Failed to generate flashcards.' }); }
 });
+
 
 app.post('/api/quiz', authenticateToken, async (req, res) => {
   try {
@@ -260,17 +284,31 @@ app.post('/api/quiz', authenticateToken, async (req, res) => {
   } catch (err) { console.error('Quiz error:', err); res.status(500).json({ error: 'Failed to generate quiz.' }); }
 });
 
+
+// FIX: Accept explicit `days` field and use it as a hard constraint in the AI prompt
 app.post('/api/plan', authenticateToken, async (req, res) => {
   try {
-    const { content, examDate, hoursPerDay = 2, subject = 'General' } = req.body;
+    const { content, examDate, hoursPerDay = 2, subject = 'General', days } = req.body;
     if (!content) return res.status(400).json({ error: 'Content is required.' });
-    const systemPrompt = `You are an expert study planner. Create a study timetable.\nSubject: ${subject}\nExam date: ${examDate || 'Not specified'}\nHours/day: ${hoursPerDay}\nReturn ONLY a valid JSON object:\n{"totalDays":14,"hoursPerDay":2,"plan":[{"day":1,"date":"Day 1","topics":[],"tasks":[],"duration":"2 hours","focus":"..."}],"tips":[],"summary":""}\nNo extra text, just the JSON.`;
+
+    // Determine the number of days to use — prefer explicit `days`, fall back to parsing examDate
+    let numDays = 7; // default
+    if (days && Number.isFinite(Number(days)) && Number(days) > 0) {
+      numDays = Math.round(Number(days));
+    } else if (examDate) {
+      const match = String(examDate).match(/(\d+)/);
+      if (match) numDays = Math.min(Math.max(parseInt(match[1]), 1), 90);
+    }
+
+    const systemPrompt = `You are an expert study planner. Create a ${numDays}-day study timetable. You MUST produce exactly ${numDays} days — no more, no less.\nSubject: ${subject}\nHours/day: ${hoursPerDay}\nReturn ONLY a valid JSON object:\n{"totalDays":${numDays},"hoursPerDay":${hoursPerDay},"plan":[{"day":1,"date":"Day 1","topics":[],"tasks":[],"duration":"${hoursPerDay} hours","focus":"..."}],"tips":[],"summary":""}\nThe "plan" array MUST have exactly ${numDays} entries (day 1 through day ${numDays}). No extra text, just the JSON.`;
+
     const result = await groqChat(systemPrompt, content.slice(0, 8000));
     const parsed = parseJSON(result);
     if (!parsed) return res.status(500).json({ error: 'Failed to generate study plan. Please try again.' });
     res.json({ success: true, plan: parsed });
   } catch (err) { console.error('Plan error:', err); res.status(500).json({ error: 'Failed to generate study plan.' }); }
 });
+
 
 app.post('/api/grade', authenticateToken, async (req, res) => {
   try {
@@ -283,6 +321,7 @@ app.post('/api/grade', authenticateToken, async (req, res) => {
     res.json({ success: true, result: parsed });
   } catch (err) { console.error('Grade error:', err); res.status(500).json({ error: 'Failed to grade answer.' }); }
 });
+
 
 app.post('/api/youtube', authenticateToken, async (req, res) => {
   try {
@@ -311,6 +350,7 @@ app.post('/api/youtube', authenticateToken, async (req, res) => {
   } catch (err) { console.error('YouTube error:', err); res.status(500).json({ error: 'Failed to process YouTube video.' }); }
 });
 
+
 // --- SESSIONS ---
 app.post('/api/sessions/save', authenticateToken, async (req, res) => {
   try {
@@ -324,12 +364,14 @@ app.post('/api/sessions/save', authenticateToken, async (req, res) => {
   } catch (err) { console.error('Save session error:', err); res.status(500).json({ error: 'Failed to save session.' }); }
 });
 
+
 app.get('/api/sessions', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT id, title, type, created_at FROM sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [req.user.userId]);
     res.json({ success: true, sessions: result.rows });
   } catch (err) { console.error('Get sessions error:', err); res.status(500).json({ error: 'Failed to get sessions.' }); }
 });
+
 
 app.get('/api/sessions/:sessionId', authenticateToken, async (req, res) => {
   try {
@@ -339,6 +381,7 @@ app.get('/api/sessions/:sessionId', authenticateToken, async (req, res) => {
   } catch (err) { console.error('Get session error:', err); res.status(500).json({ error: 'Failed to get session.' }); }
 });
 
+
 app.delete('/api/sessions/:sessionId', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('DELETE FROM sessions WHERE id = $1 AND user_id = $2 RETURNING id', [req.params.sessionId, req.user.userId]);
@@ -346,6 +389,7 @@ app.delete('/api/sessions/:sessionId', authenticateToken, async (req, res) => {
     res.json({ success: true, message: 'Session deleted.' });
   } catch (err) { console.error('Delete session error:', err); res.status(500).json({ error: 'Failed to delete session.' }); }
 });
+
 
 // --- PROGRESS ---
 app.post('/api/progress/save', authenticateToken, async (req, res) => {
@@ -360,12 +404,14 @@ app.post('/api/progress/save', authenticateToken, async (req, res) => {
   } catch (err) { console.error('Save progress error:', err); res.status(500).json({ error: 'Failed to save progress.' }); }
 });
 
+
 app.get('/api/progress/:planId', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM progress WHERE user_id = $1 AND plan_id = $2 ORDER BY day_number', [req.user.userId, req.params.planId]);
     res.json({ success: true, progress: result.rows });
   } catch (err) { console.error('Get progress error:', err); res.status(500).json({ error: 'Failed to get progress.' }); }
 });
+
 
 // --- STATS ---
 app.get('/api/stats', authenticateToken, async (req, res) => {
@@ -387,6 +433,7 @@ app.get('/api/stats', authenticateToken, async (req, res) => {
   } catch (err) { console.error('Stats error:', err); res.status(500).json({ error: 'Failed to get stats.' }); }
 });
 
+
 // --- ERROR HANDLER ---
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
@@ -394,6 +441,7 @@ app.use((err, req, res, next) => {
   if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'File too large. Maximum size is 20MB.' });
   res.status(500).json({ error: err.message || 'Internal server error.' });
 });
+
 
 // --- START ---
 app.listen(PORT, () => {
