@@ -11,6 +11,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
 import pdfParse from 'pdf-parse/lib/pdf-parse.js';
+import mammoth from 'mammoth';
 
 
 const { Pool } = pkg;
@@ -22,23 +23,19 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 
-// Trust Render's reverse proxy (fixes ERR_ERL_UNEXPECTED_X_FORWARDED_FOR)
 app.set('trust proxy', 1);
 
 
-// --- CLIENTS ---
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 
-// --- DATABASE ---
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
 
-// --- CORS ---
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
   : [
@@ -67,7 +64,6 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 
-// --- RATE LIMITING ---
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
@@ -86,19 +82,30 @@ app.use('/api/', generalLimiter);
 app.use('/auth/', authLimiter);
 
 
-// --- FILE UPLOAD ---
+const ALLOWED_MIMETYPES = [
+  'application/pdf',
+  'text/plain',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/msword',
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+];
+
 const upload = multer({
   dest: 'uploads/',
   limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = ['application/pdf', 'text/plain', 'image/jpeg', 'image/png', 'image/webp'];
-    if (allowed.includes(file.mimetype)) cb(null, true);
-    else cb(new Error('Only PDF, TXT, JPG, PNG, WEBP files are allowed'));
+    const allowedExt = /\.(pdf|txt|md|docx|doc|jpg|jpeg|png|webp)$/i;
+    if (ALLOWED_MIMETYPES.includes(file.mimetype) || allowedExt.test(file.originalname)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF, DOCX, TXT, JPG, PNG, WEBP files are allowed'));
+    }
   },
 });
 
 
-// --- JWT MIDDLEWARE ---
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -113,7 +120,6 @@ const authenticateToken = (req, res, next) => {
 };
 
 
-// --- HELPERS ---
 const chunkText = (text, maxChunkSize = 8000) => {
   if (text.length <= maxChunkSize) return [text];
   const chunks = [];
@@ -153,10 +159,9 @@ const parseJSON = (text) => {
 };
 
 
-// --- HEALTH ---
 app.get('/', (req, res) => {
   res.json({
-    status: 'StudyForge API is running', version: '2.0.0', timestamp: new Date().toISOString(),
+    status: 'StudyForge API is running', version: '2.1.0', timestamp: new Date().toISOString(),
     endpoints: {
       auth: ['/auth/signup', '/auth/login', '/auth/me'],
       api: ['/api/extract', '/api/flashcards', '/api/quiz', '/api/plan', '/api/grade', '/api/youtube'],
@@ -173,7 +178,6 @@ app.get('/health', (req, res) => {
 });
 
 
-// --- AUTH ---
 app.post('/auth/signup', async (req, res) => {
   try {
     const { email, password, name } = req.body;
@@ -217,29 +221,39 @@ app.get('/auth/me', authenticateToken, async (req, res) => {
 });
 
 
-// --- API ROUTES ---
 app.post('/api/extract', authenticateToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
     const filePath = req.file.path;
+    const originalName = req.file.originalname || '';
+    const mime = req.file.mimetype;
     let extractedText = '';
-    if (req.file.mimetype === 'application/pdf') {
+
+    if (mime === 'application/pdf' || originalName.match(/\.pdf$/i)) {
       const dataBuffer = fs.readFileSync(filePath);
       const pdfData = await pdfParse(dataBuffer);
       extractedText = pdfData.text;
-    } else if (req.file.mimetype === 'text/plain') {
+    } else if (
+      mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
+      mime === 'application/msword' ||
+      originalName.match(/\.docx?$/i)
+    ) {
+      const result = await mammoth.extractRawText({ path: filePath });
+      extractedText = result.value;
+    } else if (mime === 'text/plain' || originalName.match(/\.(txt|md)$/i)) {
       extractedText = fs.readFileSync(filePath, 'utf8');
     } else {
       const imageData = fs.readFileSync(filePath).toString('base64');
       const response = await groq.chat.completions.create({
         model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        messages: [{ role: 'user', content: [{ type: 'text', text: 'Extract all text from this image. Return only the extracted text, nothing else.' }, { type: 'image_url', image_url: { url: `data:${req.file.mimetype};base64,${imageData}` } }] }],
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'Extract all text from this image. Return only the extracted text, nothing else.' }, { type: 'image_url', image_url: { url: `data:${mime};base64,${imageData}` } }] }],
         max_tokens: 4096,
       });
       extractedText = response.choices[0].message.content;
     }
+
     fs.unlinkSync(filePath);
-    if (!extractedText || extractedText.trim().length < 10) return res.status(422).json({ error: 'Could not extract readable text from this file.' });
+    if (!extractedText || extractedText.trim().length < 10) return res.status(422).json({ error: 'Could not extract readable text from this file. Make sure it contains actual text (not a scanned image).' });
     res.json({ success: true, text: extractedText.trim(), wordCount: extractedText.trim().split(/\s+/).length, charCount: extractedText.trim().length });
   } catch (err) {
     console.error('Extract error:', err);
@@ -285,23 +299,18 @@ app.post('/api/quiz', authenticateToken, async (req, res) => {
 });
 
 
-// FIX: Accept explicit `days` field and use it as a hard constraint in the AI prompt
 app.post('/api/plan', authenticateToken, async (req, res) => {
   try {
     const { content, examDate, hoursPerDay = 2, subject = 'General', days } = req.body;
     if (!content) return res.status(400).json({ error: 'Content is required.' });
-
-    // Determine the number of days to use — prefer explicit `days`, fall back to parsing examDate
-    let numDays = 7; // default
+    let numDays = 7;
     if (days && Number.isFinite(Number(days)) && Number(days) > 0) {
       numDays = Math.round(Number(days));
     } else if (examDate) {
       const match = String(examDate).match(/(\d+)/);
       if (match) numDays = Math.min(Math.max(parseInt(match[1]), 1), 90);
     }
-
-    const systemPrompt = `You are an expert study planner. Create a ${numDays}-day study timetable. You MUST produce exactly ${numDays} days — no more, no less.\nSubject: ${subject}\nHours/day: ${hoursPerDay}\nReturn ONLY a valid JSON object:\n{"totalDays":${numDays},"hoursPerDay":${hoursPerDay},"plan":[{"day":1,"date":"Day 1","topics":[],"tasks":[],"duration":"${hoursPerDay} hours","focus":"..."}],"tips":[],"summary":""}\nThe "plan" array MUST have exactly ${numDays} entries (day 1 through day ${numDays}). No extra text, just the JSON.`;
-
+    const systemPrompt = `You are an expert study planner. Create a ${numDays}-day study timetable. You MUST produce exactly ${numDays} days \u2014 no more, no less.\nSubject: ${subject}\nHours/day: ${hoursPerDay}\nReturn ONLY a valid JSON object:\n{"totalDays":${numDays},"hoursPerDay":${hoursPerDay},"plan":[{"day":1,"date":"Day 1","topics":[],"tasks":[],"duration":"${hoursPerDay} hours","focus":"..."}],"tips":[],"summary":""}\nThe "plan" array MUST have exactly ${numDays} entries (day 1 through day ${numDays}). No extra text, just the JSON.`;
     const result = await groqChat(systemPrompt, content.slice(0, 8000));
     const parsed = parseJSON(result);
     if (!parsed) return res.status(500).json({ error: 'Failed to generate study plan. Please try again.' });
@@ -351,7 +360,6 @@ app.post('/api/youtube', authenticateToken, async (req, res) => {
 });
 
 
-// --- SESSIONS ---
 app.post('/api/sessions/save', authenticateToken, async (req, res) => {
   try {
     const { title, type, content, data } = req.body;
@@ -391,7 +399,6 @@ app.delete('/api/sessions/:sessionId', authenticateToken, async (req, res) => {
 });
 
 
-// --- PROGRESS ---
 app.post('/api/progress/save', authenticateToken, async (req, res) => {
   try {
     const { planId, dayNumber, completed, notes } = req.body;
@@ -413,7 +420,6 @@ app.get('/api/progress/:planId', authenticateToken, async (req, res) => {
 });
 
 
-// --- STATS ---
 app.get('/api/stats', authenticateToken, async (req, res) => {
   try {
     const [sessionsResult, progressResult] = await Promise.all([
@@ -434,7 +440,6 @@ app.get('/api/stats', authenticateToken, async (req, res) => {
 });
 
 
-// --- ERROR HANDLER ---
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   if (err.message?.includes('CORS')) return res.status(403).json({ error: err.message });
@@ -443,7 +448,6 @@ app.use((err, req, res, next) => {
 });
 
 
-// --- START ---
 app.listen(PORT, () => {
   console.log(`StudyForge API running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
