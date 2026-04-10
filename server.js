@@ -14,26 +14,38 @@ import pdfParse from 'pdf-parse/lib/pdf-parse.js';
 import mammoth from 'mammoth';
 
 
+
+
 const { Pool } = pkg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+
 
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 
+
+
 app.set('trust proxy', 1);
+
+
 
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 
+
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
+
+
 
 
 const allowedOrigins = process.env.ALLOWED_ORIGINS
@@ -44,6 +56,8 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
       'https://study-forge-frontend.vercel.app',
       'https://studyforge-frontend.vercel.app',
     ];
+
+
 
 
 app.use(cors({
@@ -60,8 +74,12 @@ app.use(cors({
 }));
 
 
+
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+
 
 
 const generalLimiter = rateLimit({
@@ -71,6 +89,8 @@ const generalLimiter = rateLimit({
 });
 
 
+
+
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -78,8 +98,12 @@ const authLimiter = rateLimit({
 });
 
 
+
+
 app.use('/api/', generalLimiter);
 app.use('/auth/', authLimiter);
+
+
 
 
 const ALLOWED_MIMETYPES = [
@@ -91,6 +115,7 @@ const ALLOWED_MIMETYPES = [
   'image/png',
   'image/webp',
 ];
+
 
 const upload = multer({
   dest: 'uploads/',
@@ -106,6 +131,8 @@ const upload = multer({
 });
 
 
+
+
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -118,6 +145,8 @@ const authenticateToken = (req, res, next) => {
     return res.status(403).json({ error: 'Invalid or expired token. Please login again.' });
   }
 };
+
+
 
 
 const chunkText = (text, maxChunkSize = 8000) => {
@@ -137,6 +166,8 @@ const chunkText = (text, maxChunkSize = 8000) => {
 };
 
 
+
+
 const groqChat = async (systemPrompt, userMessage, model = 'llama-3.3-70b-versatile') => {
   const response = await groq.chat.completions.create({
     model,
@@ -151,6 +182,8 @@ const groqChat = async (systemPrompt, userMessage, model = 'llama-3.3-70b-versat
 };
 
 
+
+
 const parseJSON = (text) => {
   try {
     const match = text.match(/```json\n?([\s\S]*?)\n?```/) || text.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
@@ -159,12 +192,14 @@ const parseJSON = (text) => {
 };
 
 
+
+
 app.get('/', (req, res) => {
   res.json({
-    status: 'StudyForge API is running', version: '2.1.0', timestamp: new Date().toISOString(),
+    status: 'StudyForge API is running', version: '2.2.0', timestamp: new Date().toISOString(),
     endpoints: {
       auth: ['/auth/signup', '/auth/login', '/auth/me'],
-      api: ['/api/extract', '/api/flashcards', '/api/quiz', '/api/plan', '/api/grade', '/api/youtube'],
+      api: ['/api/extract', '/api/flashcards', '/api/quiz', '/api/theory', '/api/plan', '/api/grade', '/api/youtube'],
       sessions: ['/api/sessions', '/api/sessions/save'],
       progress: ['/api/progress/save', '/api/progress/:planId'],
       stats: ['/api/stats'],
@@ -173,9 +208,13 @@ app.get('/', (req, res) => {
 });
 
 
+
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', uptime: Math.floor(process.uptime()), timestamp: new Date().toISOString() });
 });
+
+
 
 
 app.post('/auth/signup', async (req, res) => {
@@ -197,6 +236,8 @@ app.post('/auth/signup', async (req, res) => {
 });
 
 
+
+
 app.post('/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -212,6 +253,8 @@ app.post('/auth/login', async (req, res) => {
 });
 
 
+
+
 app.get('/auth/me', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT id, email, name, created_at FROM users WHERE id = $1', [req.user.userId]);
@@ -221,6 +264,8 @@ app.get('/auth/me', authenticateToken, async (req, res) => {
 });
 
 
+
+
 app.post('/api/extract', authenticateToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
@@ -228,6 +273,7 @@ app.post('/api/extract', authenticateToken, upload.single('file'), async (req, r
     const originalName = req.file.originalname || '';
     const mime = req.file.mimetype;
     let extractedText = '';
+
 
     if (mime === 'application/pdf' || originalName.match(/\.pdf$/i)) {
       const dataBuffer = fs.readFileSync(filePath);
@@ -252,6 +298,7 @@ app.post('/api/extract', authenticateToken, upload.single('file'), async (req, r
       extractedText = response.choices[0].message.content;
     }
 
+
     fs.unlinkSync(filePath);
     if (!extractedText || extractedText.trim().length < 10) return res.status(422).json({ error: 'Could not extract readable text from this file. Make sure it contains actual text (not a scanned image).' });
     res.json({ success: true, text: extractedText.trim(), wordCount: extractedText.trim().split(/\s+/).length, charCount: extractedText.trim().length });
@@ -263,40 +310,62 @@ app.post('/api/extract', authenticateToken, upload.single('file'), async (req, r
 });
 
 
+
+
 app.post('/api/flashcards', authenticateToken, async (req, res) => {
   try {
     const { content, count = 10, difficulty = 'medium' } = req.body;
     if (!content) return res.status(400).json({ error: 'Content is required.' });
-    const chunks = chunkText(content);
-    const allFlashcards = [];
-    for (const chunk of chunks.slice(0, 3)) {
-      const systemPrompt = `You are an expert educator. Generate exactly ${count} high-quality flashcards from the provided content.\nDifficulty level: ${difficulty}.\nReturn ONLY a valid JSON array:\n[{ "front": "Question", "back": "Answer", "topic": "Topic" }]\nNo extra text, just the JSON array.`;
-      const result = await groqChat(systemPrompt, chunk);
-      const parsed = parseJSON(result);
-      if (parsed && Array.isArray(parsed)) allFlashcards.push(...parsed);
-    }
-    if (allFlashcards.length === 0) return res.status(500).json({ error: 'Failed to generate flashcards. Please try again.' });
-    res.json({ success: true, flashcards: allFlashcards.slice(0, count * chunks.length), count: allFlashcards.length });
+    // Only use the first chunk to avoid generating more cards than requested
+    const chunk = chunkText(content)[0];
+    const systemPrompt = `You are an expert educator. Generate exactly ${count} high-quality flashcards from the provided content.\nDifficulty level: ${difficulty}.\nReturn ONLY a valid JSON array:\n[{ "front": "Question", "back": "Answer", "topic": "Topic" }]\nNo extra text, just the JSON array.`;
+    const result = await groqChat(systemPrompt, chunk);
+    const parsed = parseJSON(result);
+    if (!parsed || !Array.isArray(parsed) || parsed.length === 0) return res.status(500).json({ error: 'Failed to generate flashcards. Please try again.' });
+    // Enforce exact count
+    const flashcards = parsed.slice(0, count);
+    res.json({ success: true, flashcards, count: flashcards.length });
   } catch (err) { console.error('Flashcards error:', err); res.status(500).json({ error: 'Failed to generate flashcards.' }); }
 });
+
+
 
 
 app.post('/api/quiz', authenticateToken, async (req, res) => {
   try {
     const { content, count = 10, type = 'multiple_choice' } = req.body;
     if (!content) return res.status(400).json({ error: 'Content is required.' });
-    const chunks = chunkText(content);
-    const allQuestions = [];
-    for (const chunk of chunks.slice(0, 3)) {
-      const systemPrompt = `You are an expert educator. Generate exactly ${count} quiz questions.\nReturn ONLY a valid JSON array:\n[{ "question": "Q", "options": ["A","B","C","D"], "correct": 0, "explanation": "Why" }]\n"correct" is the index (0-3). No extra text, just the JSON array.`;
-      const result = await groqChat(systemPrompt, chunk);
-      const parsed = parseJSON(result);
-      if (parsed && Array.isArray(parsed)) allQuestions.push(...parsed);
-    }
-    if (allQuestions.length === 0) return res.status(500).json({ error: 'Failed to generate quiz. Please try again.' });
-    res.json({ success: true, questions: allQuestions.slice(0, count * chunks.length), count: allQuestions.length });
+    // Only use the first chunk to avoid generating more questions than requested
+    const chunk = chunkText(content)[0];
+    const systemPrompt = `You are an expert educator. Generate exactly ${count} quiz questions.\nReturn ONLY a valid JSON array:\n[{ "question": "Q", "options": ["A","B","C","D"], "correct": 0, "explanation": "Why" }]\n"correct" is the index (0-3). No extra text, just the JSON array.`;
+    const result = await groqChat(systemPrompt, chunk);
+    const parsed = parseJSON(result);
+    if (!parsed || !Array.isArray(parsed) || parsed.length === 0) return res.status(500).json({ error: 'Failed to generate quiz. Please try again.' });
+    // Enforce exact count
+    const questions = parsed.slice(0, count);
+    res.json({ success: true, questions, count: questions.length });
   } catch (err) { console.error('Quiz error:', err); res.status(500).json({ error: 'Failed to generate quiz.' }); }
 });
+
+
+
+
+// Theory endpoint: generates open-ended questions for the user to defend
+app.post('/api/theory', authenticateToken, async (req, res) => {
+  try {
+    const { content, count = 3, topic = 'the subject' } = req.body;
+    if (!content) return res.status(400).json({ error: 'Content is required.' });
+    const chunk = chunkText(content)[0];
+    const systemPrompt = `You are an expert examiner. Generate exactly ${count} open-ended theory questions about ${topic}.\nThese questions should require the student to explain concepts, analyze ideas, compare theories, or defend a position — not just recall facts.\nReturn ONLY a valid JSON array:\n[{ "question": "Explain why...", "hint": "Consider discussing...", "keyPoints": ["point1", "point2"] }]\nNo extra text, just the JSON array.`;
+    const result = await groqChat(systemPrompt, chunk);
+    const parsed = parseJSON(result);
+    if (!parsed || !Array.isArray(parsed) || parsed.length === 0) return res.status(500).json({ error: 'Failed to generate theory questions. Please try again.' });
+    const questions = parsed.slice(0, count);
+    res.json({ success: true, questions, count: questions.length });
+  } catch (err) { console.error('Theory error:', err); res.status(500).json({ error: 'Failed to generate theory questions.' }); }
+});
+
+
 
 
 app.post('/api/plan', authenticateToken, async (req, res) => {
@@ -319,6 +388,8 @@ app.post('/api/plan', authenticateToken, async (req, res) => {
 });
 
 
+
+
 app.post('/api/grade', authenticateToken, async (req, res) => {
   try {
     const { question, answer, context = '' } = req.body;
@@ -330,6 +401,8 @@ app.post('/api/grade', authenticateToken, async (req, res) => {
     res.json({ success: true, result: parsed });
   } catch (err) { console.error('Grade error:', err); res.status(500).json({ error: 'Failed to grade answer.' }); }
 });
+
+
 
 
 app.post('/api/youtube', authenticateToken, async (req, res) => {
@@ -360,6 +433,8 @@ app.post('/api/youtube', authenticateToken, async (req, res) => {
 });
 
 
+
+
 app.post('/api/sessions/save', authenticateToken, async (req, res) => {
   try {
     const { title, type, content, data } = req.body;
@@ -373,12 +448,16 @@ app.post('/api/sessions/save', authenticateToken, async (req, res) => {
 });
 
 
+
+
 app.get('/api/sessions', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT id, title, type, created_at FROM sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [req.user.userId]);
     res.json({ success: true, sessions: result.rows });
   } catch (err) { console.error('Get sessions error:', err); res.status(500).json({ error: 'Failed to get sessions.' }); }
 });
+
+
 
 
 app.get('/api/sessions/:sessionId', authenticateToken, async (req, res) => {
@@ -390,6 +469,8 @@ app.get('/api/sessions/:sessionId', authenticateToken, async (req, res) => {
 });
 
 
+
+
 app.delete('/api/sessions/:sessionId', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('DELETE FROM sessions WHERE id = $1 AND user_id = $2 RETURNING id', [req.params.sessionId, req.user.userId]);
@@ -397,6 +478,8 @@ app.delete('/api/sessions/:sessionId', authenticateToken, async (req, res) => {
     res.json({ success: true, message: 'Session deleted.' });
   } catch (err) { console.error('Delete session error:', err); res.status(500).json({ error: 'Failed to delete session.' }); }
 });
+
+
 
 
 app.post('/api/progress/save', authenticateToken, async (req, res) => {
@@ -412,12 +495,16 @@ app.post('/api/progress/save', authenticateToken, async (req, res) => {
 });
 
 
+
+
 app.get('/api/progress/:planId', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM progress WHERE user_id = $1 AND plan_id = $2 ORDER BY day_number', [req.user.userId, req.params.planId]);
     res.json({ success: true, progress: result.rows });
   } catch (err) { console.error('Get progress error:', err); res.status(500).json({ error: 'Failed to get progress.' }); }
 });
+
+
 
 
 app.get('/api/stats', authenticateToken, async (req, res) => {
@@ -440,12 +527,16 @@ app.get('/api/stats', authenticateToken, async (req, res) => {
 });
 
 
+
+
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   if (err.message?.includes('CORS')) return res.status(403).json({ error: err.message });
   if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'File too large. Maximum size is 20MB.' });
   res.status(500).json({ error: err.message || 'Internal server error.' });
 });
+
+
 
 
 app.listen(PORT, () => {
